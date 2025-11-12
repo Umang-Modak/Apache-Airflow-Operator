@@ -417,6 +417,7 @@ class YeeduNotebookRunOperator:
                 cell_metadata.pop("endTime", None)
                 cell_metadata.pop("lastRunTime", None)
                 cell_metadata.pop("runBy", None)
+                cell_metadata.pop("executionCount", None)
                 cell["metadata"] = cell_metadata
 
             self.log.info(
@@ -712,7 +713,7 @@ class YeeduNotebookRunOperator:
 
                 if self.content_status == "ok":
                     try:
-                        self.executionCount += 1
+                        self.executionCount = content.get("execution_count")
                         self.set_execution_count(msg_id)
                         self.log.debug(
                             "Cell execution successful, removing from queue")
@@ -728,6 +729,8 @@ class YeeduNotebookRunOperator:
                         pass
 
                 elif self.content_status == "error":
+                    self.execution_count = content.get("execution_count")
+                    self.set_execution_count(msg_id)
                     self.error_value = content.get("evalue", "")
                     traceback = content.get("traceback", [])
                     self.log.debug(
