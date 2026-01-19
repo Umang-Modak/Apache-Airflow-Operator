@@ -398,9 +398,10 @@ class YeeduHook(BaseHook):
 
             response = self._api_request('POST', job_url, data)
             api_status_code = response.status_code
+            response_json = response.json()
+            
             if api_status_code == 200:
-                response_json = response.json()
-                run_id = response.json().get('run_id')
+                run_id = response_json.get('run_id')
                 if run_id:
                     return run_id
                 else:

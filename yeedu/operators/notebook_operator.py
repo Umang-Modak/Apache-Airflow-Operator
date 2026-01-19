@@ -200,7 +200,7 @@ class YeeduNotebookRunOperator:
                 self.run_id = response.json().get("run_id")
 
                 notebook_run_url = f"{self.base_url}tenant/{self.tenant_id}/workspace/{self.workspace_id}/run/{self.run_id}/run-metrics?type=notebook".replace(
-                    f":{self.restapi_port}/api/v1", ""
+                    f":{self.restapi_port}/api/v1", ":5173"
                 )
                 self.log.info(
                     "Check Yeedu notebook run status and logs here " + notebook_run_url
@@ -1436,7 +1436,7 @@ class YeeduNotebookRunOperator:
 
                     if notebook_status in ["TERMINATED", "ERROR"]:
                         notebook_run_url = f"{self.base_url}tenant/{self.tenant_id}/workspace/{self.workspace_id}/run/{self.run_id}/run-logs?log_type=stderr".replace(
-                            f":{self.restapi_port}/api/v1", ""
+                            f":{self.restapi_port}/api/v1", ":5173"
                         )
                         raise AirflowException(
                             f"Notebook is in {notebook_status} state. \n Please check notebook logs for detailed error:{notebook_run_url}"
