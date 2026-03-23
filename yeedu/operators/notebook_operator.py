@@ -1,17 +1,17 @@
-import copy
-import json
-import socket
-import threading
-import time
-import uuid
-import websocket
-import ssl
-import rel
-import signal
-import re
-from datetime import datetime, timezone
-from airflow.exceptions import AirflowException
 from yeedu.hooks.yeedu import YeeduHook
+from airflow.exceptions import AirflowException
+from datetime import datetime, timezone
+import re
+import signal
+import rel
+import ssl
+import websocket
+import uuid
+import time
+import threading
+import socket
+import json
+import copy
 
 
 class YeeduNotebookRunOperator:
@@ -51,6 +51,7 @@ class YeeduNotebookRunOperator:
         self.cell_output_data = []
         self.execution_times = {}
         self.notebook_json = {}
+        self.cells_with_saved_outputs = set()
         # Cluster bump tracking
         # Start at -1 to indicate using notebook's default cluster
         self.current_cluster_index = -1
@@ -81,6 +82,11 @@ class YeeduNotebookRunOperator:
             token_variable_name=self.token_variable_name,
         )
         self.log = logger
+
+        # Tracking for email notifications
+        self.attempted_clusters: list = []
+        self.last_error_summary: str = None
+        self.yeedu_run_url: str = None
 
     def _should_bump_cluster_from_logs(self, run_id: int) -> bool:
         """
@@ -118,6 +124,40 @@ class YeeduNotebookRunOperator:
                 f"Error checking logs for cluster bump eligibility: {e}")
             return False
 
+    def _build_error_summary(self, run_id: int = None) -> str:
+        """
+        Build a concise error summary from notebook execution for email notifications.
+
+        Args:
+            run_id: The run ID to fetch errors for (optional, uses self.run_id if not provided)
+
+        Returns:
+            A truncated error summary string
+        """
+        try:
+            # First check if we have cell-level error information
+            if self.error_name and self.error_value:
+                error_text = f"{self.error_name}: {self.error_value}"
+                return error_text[:1500] if len(error_text) > 1500 else error_text
+
+            # Try to get workflow errors
+            rid = run_id or self.run_id
+            if rid:
+                wf_errors = self.hook.get_notebook_workflow_errors(rid) or []
+                if wf_errors:
+                    error_text = "\n".join(wf_errors[-10:])
+                    return error_text[:1500] if len(error_text) > 1500 else error_text
+
+                # Fall back to stderr
+                stderr = self.hook.get_notebook_logs(
+                    rid, "stderr", last_n_lines=20) or ""
+                if stderr:
+                    return stderr[:1500] if len(stderr) > 1500 else stderr
+
+            return "No error details available"
+        except Exception as e:
+            return f"Failed to retrieve error details: {e}"
+
     def _can_bump_cluster(self) -> bool:
         """
         Check if cluster bump is possible (more clusters available).
@@ -153,6 +193,12 @@ class YeeduNotebookRunOperator:
             self.current_cluster_index += 1
             new_cluster_id = self.cluster_ids[self.current_cluster_index]
 
+            # Track attempted clusters for email notifications
+            self.attempted_clusters.append(new_cluster_id)
+
+            # Save pending cell outputs before stopping notebook
+            self.save_pending_outputs(reason="before cluster bump")
+
             # Stop current notebook instance
             self.stop_notebook()
 
@@ -171,6 +217,33 @@ class YeeduNotebookRunOperator:
 
         except Exception as e:
             self.log.error(f"Failed to bump cluster: {e}")
+            return False
+
+    def save_pending_outputs(self, reason: str = "") -> bool:
+        """
+        Save pending cell outputs before state changes.
+
+        Args:
+            reason: Description of why outputs are being saved (for logging)
+
+        Returns:
+            bool: True if outputs were saved, False if no outputs to save
+        """
+        if not self.cell_output_data:
+            self.log.debug(
+                f"No pending outputs to save{' (' + reason + ')' if reason else ''}")
+            return False
+
+        output_count = len(self.cell_output_data)
+        self.log.info(
+            f"Saving {output_count} pending output(s){' - ' + reason if reason else ''}")
+
+        try:
+            self.update_notebook_cells()
+            self.log.info(f"Successfully saved {output_count} output(s)")
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to save pending outputs: {e}")
             return False
 
     def create_notebook_instance(self):
@@ -202,6 +275,7 @@ class YeeduNotebookRunOperator:
                 notebook_run_url = f"{self.base_url}tenant/{self.tenant_id}/workspace/{self.workspace_id}/run/{self.run_id}/run-metrics?type=notebook".replace(
                     f":{self.restapi_port}/api/v1", ":5173"
                 )
+                self.yeedu_run_url = notebook_run_url  # Store for email notifications
                 self.log.info(
                     "Check Yeedu notebook run status and logs here " + notebook_run_url
                 )
@@ -565,6 +639,8 @@ class YeeduNotebookRunOperator:
 
             if update_cells_response.status_code == 200:
                 self.log.info("Notebook cells updated successfully.")
+                # Track this cell as saved to prevent overwriting
+                self.cells_with_saved_outputs.add(msg_id_to_update)
                 return update_cells_response
             else:
                 raise Exception(
@@ -579,6 +655,10 @@ class YeeduNotebookRunOperator:
         try:
             if self.notebook_executed:
                 return 0
+
+            # Save any pending outputs before exiting
+            self.save_pending_outputs(reason="before exit")
+
             self.log.info(f"Notebook exited. Reason: {exit_reason}")
             self.notebook_cells.clear()
             if self.check_notebook_instance_status() in ["SUBMITTED", "RUNNING"]:
@@ -665,20 +745,6 @@ class YeeduNotebookRunOperator:
                 self.error_value = content.get("evalue", "")
                 traceback = content.get("traceback", [])
 
-                # Check if this error qualifies for cluster bump
-                if self._should_bump_cluster_from_error(self.error_name, self.error_value, traceback):
-                    if self._can_bump_cluster():
-                        self.log.info(
-                            f"Error qualifies for cluster bump: {self.error_name} - {self.error_value}")
-                        self.should_bump_cluster = True
-                        return  # Exit immediately to trigger cluster bump
-                    else:
-                        # Final cluster failure - no more clusters available
-                        self.log.error(
-                            f"Bump-eligible error occurred on final cluster: {self.error_name} - {self.error_value}")
-                        self.notebook_executed = False
-                        return  # Exit immediately to break the infinite wait
-
                 if traceback:
                     formatted_error_output = self.format_error_output(
                         traceback)
@@ -702,6 +768,23 @@ class YeeduNotebookRunOperator:
                     for tb in traceback:
                         self.log.error(tb)
 
+                # Check if this error qualifies for cluster bump (AFTER saving the error)
+                if self._should_bump_cluster_from_error(self.error_name, self.error_value, traceback):
+                    # Save error to notebook before cluster bump or final failure
+                    self.update_notebook_cells()
+
+                    if self._can_bump_cluster():
+                        self.log.info(
+                            f"Error qualifies for cluster bump: {self.error_name} - {self.error_value}")
+                        self.should_bump_cluster = True
+                        return  # Exit immediately to trigger cluster bump
+                    else:
+                        # Final cluster failure - no more clusters available
+                        self.log.error(
+                            f"Bump-eligible error occurred on final cluster: {self.error_name} - {self.error_value}")
+                        self.notebook_executed = False
+                        return  # Exit immediately to break the infinite wait
+
             elif msg_type == "execute_input":
                 content = response.get("content", {})
                 code_input = content.get("code", "")
@@ -723,6 +806,8 @@ class YeeduNotebookRunOperator:
                     if self._can_bump_cluster():
                         self.log.info(
                             f"OOM/Resource error detected in stream: {text_value[:200]}...")
+                        self.log.info(
+                            "Triggering cluster bump - outputs will be saved before restart")
                         self.should_bump_cluster = True
                     else:
                         self.log.error(
@@ -732,8 +817,21 @@ class YeeduNotebookRunOperator:
                             self.error_name = "ResourceLimitError"
                         if not self.error_value:
                             self.error_value = text_value.strip()[:500]
+
+                        # Append this output first, then save before marking as failed
+                        self.cell_output_data.append({
+                            "msg_id": msg_id,
+                            "output_type": "text",
+                            "Celloutput": text_value
+                        })
+
+                        # Save outputs BEFORE setting failed state
+                        self.save_pending_outputs(
+                            reason="final cluster resource error")
+
                         self.should_bump_cluster = False
                         self.notebook_executed = False
+                        return  # Exit early since we already appended output
 
                 self.cell_output_data.append({
                     "msg_id": msg_id,
@@ -771,6 +869,8 @@ class YeeduNotebookRunOperator:
                 if execution_state == "restarting":
                     self.log.error(
                         "Kernel restarting - marking execution as failed")
+                    # Save any pending outputs before marking as failed
+                    self.save_pending_outputs(reason="kernel restarting")
                     self.notebook_executed = False
                     if not self.error_name:
                         self.error_name = "KernelRestart"
@@ -785,7 +885,8 @@ class YeeduNotebookRunOperator:
                         msg_id, {})["endTime"] = end_time
                     if self.cell_output_data:
                         self.update_notebook_cells()
-                    elif response.get("parent_header", {}).get("msg_type", {}) != "kernel_info_request":
+                    elif (response.get("parent_header", {}).get("msg_type", {}) != "kernel_info_request"
+                          and msg_id not in self.cells_with_saved_outputs):
                         self.log.debug(
                             f"No cell output data for message id ({msg_id}), adding empty output")
                         self.cell_output_data.append({
@@ -873,6 +974,8 @@ class YeeduNotebookRunOperator:
                 elif self.content_status == "aborted":
                     self.log.warning(
                         f"Cell execution was aborted for message id ({msg_id})")
+                    # Save any pending outputs before marking as failed
+                    self.save_pending_outputs(reason="cell execution aborted")
                     self.log.debug(
                         "Setting notebook executed flag to False due to cell abort.")
                     self.notebook_executed = False
@@ -1403,6 +1506,7 @@ class YeeduNotebookRunOperator:
                         self.cell_output_data = []
                         self.execution_times = {}
                         self.notebook_json = {}
+                        self.cells_with_saved_outputs = set()
                         # Reset execution state for fresh start
                         self.notebook_executed = True
                         continue
@@ -1414,6 +1518,9 @@ class YeeduNotebookRunOperator:
                         return 0
 
                     # If execution failed and no cluster bump available, proceed with error handling
+                    # Save any pending outputs before cleanup
+                    self.save_pending_outputs(reason="before failure cleanup")
+
                     if self.check_notebook_instance_status() not in ["STOPPED", "TERMINATED", "ERROR"]:
                         self.log.debug(
                             "Exiting notebook due to cell execution failure.")
@@ -1475,6 +1582,8 @@ class YeeduNotebookRunOperator:
 
         except Exception as e:
             self.log.error(f"Notebook execution failed with error:  {e}")
+            # Capture error summary for email notifications
+            self.last_error_summary = self._build_error_summary()
             raise e
         finally:
             if self.run_id is not None:
